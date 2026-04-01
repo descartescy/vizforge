@@ -44,6 +44,7 @@ PlotCraft is built on the following commonly used scientific computing libraries
 - pandas >= 3.0.1
 - scipy >= 1.17.1
 - scikit-learn >= 1.8.0
+- sympy >= 1.17.1
 
 ## Chart Gallery
 
