@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import matplotlib.transforms as transforms
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Literal, Callable
 import numpy as np
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
 from .utils import floor_significant_digits, calculate_nb, _threshold_to_cost_benefit
@@ -13,6 +13,11 @@ from matplotlib.axes import Axes
 from scipy import stats
 import warnings
 import matplotlib.ticker as ticker
+from scipy.special import logit as qlogis, expit as plogis
+from scipy.stats import norm, chi2
+from scipy.optimize import minimize
+import sympy as sp
+from matplotlib.lines import Line2D
 
 
 def train_test_lift(
@@ -813,7 +818,7 @@ def dca_curve(
         model_names: List[str] = None,
         cost_benefit_axis: bool = True,
         colors: Optional[List[str]] = None,
-):
+) -> tuple[Figure, Axes]:
     """
     Plot Decision Curve Analysis (DCA) for one or more prediction models.
 
@@ -1210,12 +1215,1162 @@ def dca_curve(
 
     return fig, ax
 
+def calibration_curve(
+        real:np.ndarray | List[int] | pd.DataFrame,
+        pred:Optional[np.ndarray | List[int|float] | pd.DataFrame]=None,
+        logit_vals:Optional[np.ndarray | List[int|float]| pd.DataFrame]=None,
+        logistic_cal:bool=True,
+        nonparametric_cal:bool=True,
+        legendloc:Optional[str | tuple[float | int] | Literal[False]]=None,
+        statloc:Optional[tuple[float | int] | Literal[False]]=None,
+        riskdist:Literal["predicted","calibrated"]="predicted",
+        cex:float | int=0.7,
+) -> tuple[Figure, Axes, dict[str, np.ndarray]]:
+    r"""
+    Validate predicted probabilities against binary outcomes with a calibration plot.
 
+    Python implementation of Frank Harrell's ``val.prob`` in the R ``rms``
+    package.  Computes discrimination and calibration statistics for a set
+    of predicted probabilities and observed binary outcomes, and produces a
+    calibration plot that includes a logistic recalibration curve, a lowess
+    nonparametric smooth, and a spike histogram of the risk distribution.
+
+    The calibration plot overlays three references:
+
+    - **Ideal line** (the 45° diagonal): perfect calibration.
+    - **Logistic calibration curve**: a two-parameter (intercept + slope)
+      logistic recalibration of the original predictions.  An intercept of
+      0 and slope of 1 indicates no systematic miscalibration.
+    - **Nonparametric (lowess) curve**: a flexible smooth that reveals
+      local departures from ideal calibration.
+
+    Parameters
+    ----------
+    real : array-like of shape (n_samples,)
+        Observed binary outcomes.  Each element must be 0 or 1.
+
+    pred : array-like of shape (n_samples,), default=None
+        Predicted probabilities, each in the interval [0, 1].
+        Exactly one of ``pred`` and ``logit_vals`` must be provided.
+        If ``pred`` is given, logit values are derived internally via
+        the logit (log-odds) transform.
+
+    logit_vals : array-like of shape (n_samples,), default=None
+        Predicted values on the logit (log-odds) scale.  If provided
+        instead of ``pred``, predicted probabilities are obtained via
+        the inverse-logit (expit) transform.  Exactly one of ``pred``
+        and ``logit_vals`` must be provided.
+
+    logistic_cal : bool, default=True
+        If ``True``, plot the two-parameter logistic recalibration curve
+
+    logistic_cal : bool, default=True
+        If ``True``, plot the two-parameter Nonparametric curve
+
+    legendloc : str, tuple of float, or False, default=None
+        Location of the legend on the calibration plot.  Accepts any
+        value valid for :func:`matplotlib.axes.Axes.legend` ``loc``
+        parameter.  If ``None``, the legend is placed automatically
+        (``loc="best"``).  Set to ``False`` to suppress the legend
+        entirely.
+
+    statloc : tuple of float (x, y) or False, default=None
+        Coordinates (in data space) for the top-left corner of the
+        statistics text block.  If ``None``, the text is placed at the
+        upper-left of the axes in axes-fraction coordinates (0.02, 0.98).
+        Set to ``False`` to suppress the statistics text entirely.
+
+    riskdist : {"predicted", "calibrated"}, default="predicted"
+        Which risk distribution to display as a spike histogram along
+        the bottom of the calibration plot.
+
+        - ``"predicted"`` : use the original predicted probabilities.
+        - ``"calibrated"`` : use probabilities recalibrated through the
+          fitted logistic model.
+
+    cex : float, default=0.7
+        Character expansion factor that controls the font size of the
+        legend and statistics text.  The effective font size is
+        ``cex * 10`` points, consistent with the R ``cex`` convention.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    ax : matplotlib.axes.Axes
+
+    stats : dict
+        A dictionary of discrimination and calibration statistics with
+        the following keys:
+
+        ============  =====================================================
+        Key           Description
+        ============  =====================================================
+        Dxy           Somers' Dxy rank correlation between
+                      predicted probabilities and observed outcomes
+                      (\(= 2C - 1\)).
+        C (ROC)       Concordance statistic (area under the ROC curve).
+        R2            Nagelkerke–Cox–Snell R2 index.
+        D             Discrimination index, \((LR_{\chi^{2}} - 1) / n\),
+                      where \(LR_{\chi^{2}}\) is the likelihood-ratio
+                      \(\chi^{2}\) statistic comparing the model to a
+                      null (intercept-only) model.
+        D:Chi-sq      Likelihood-ratio \(\chi^{2}\) statistic.
+        D:p           p-value for the likelihood-ratio test.
+        U             Unreliability index,
+                      \((U_{\chi^{2}} - 2) / n\).
+        U:Chi-sq      Unreliability \(\chi^{2}\) statistic (deviance
+                      difference between original predictions and the
+                      logistic recalibration model).
+        U:p           p-value for the unreliability test.
+        Q             Quality index, D - U.
+        Brier         Brier score, \(\frac{1}{n}\sum(y_i - \hat{p}_i)^{2}\).
+        Intercept     Intercept alpha of the logistic recalibration.
+                      Ideally 0.
+        Slope         Slope beta of the logistic recalibration.
+                      Ideally 1.
+        Emax          Maximum absolute calibration error (from the lowess
+                      smooth).
+        E90           90th-percentile absolute calibration error.
+        Eavg          Mean absolute calibration error.
+        S:z           Spiegelhalter's z-statistic for testing
+                      calibration-in-the-large.
+        S:p           Two-sided p-value for Spiegelhalter's test.
+        ============  =====================================================
+
+    Raises
+    ------
+    ValueError
+        If neither ``pred`` nor ``logit_vals`` is provided, or if the
+        lengths of ``pred`` (or ``logit_vals``) and ``real`` differ.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> import matplotlib.pyplot as plt
+    >>> df = pd.read_csv("all.csv")
+    >>> fig, ax, result = val_prob(df["true"], df["pred"])
+    >>> plt.show()
+    >>> print(result)
+    """
+
+    def _logistic_fit(X, y):
+        k = X.shape[1]
+        beta0 = np.zeros(k)
+
+        def neg_ll(beta):
+            eta = X @ beta
+            ll = np.sum(y * eta - np.logaddexp(0, eta))
+            return -ll
+
+        def grad(beta):
+            eta = X @ beta
+            pr = plogis(eta)
+            return -X.T @ (y - pr)
+
+        res = minimize(neg_ll, beta0, jac=grad, method="L-BFGS-B", options={"maxiter": 200, "ftol": 1e-12})
+        coef = res.x
+        deviance = 2 * res.fun
+        return coef, deviance
+
+    def _roc_auc(y, p):
+        y = np.asarray(y, dtype=int)
+        p = np.asarray(p, dtype=float)
+        pos = p[y == 1]
+        neg = p[y == 0]
+        n1, n0 = len(pos), len(neg)
+        if n1 == 0 or n0 == 0:
+            return 0.5
+        all_vals = np.concatenate([pos, neg])
+        order = np.argsort(all_vals)
+        sorted_vals = all_vals[order]
+        ranks = np.empty(len(all_vals))
+        i = 0
+        while i < len(sorted_vals):
+            j = i
+            while j < len(sorted_vals) and sorted_vals[j] == sorted_vals[i]:
+                j += 1
+            avg_rank = (i + 1 + j) / 2.0
+            ranks[i:j] = avg_rank
+            i = j
+        inv_order = np.argsort(order)
+        ranks_orig = ranks[inv_order]
+        auc = (np.sum(ranks_orig[:n1]) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+        return auc
+
+    def _lowess(x, y, frac=2.0 / 3.0):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = len(x)
+        k = int(np.ceil(frac * n))
+        order = np.argsort(x)
+        x_s = x[order]
+        y_s = y[order]
+        y_hat = np.zeros(n)
+
+        for i in range(n):
+            dists = np.abs(x_s - x_s[i])
+            idx = np.argsort(dists)[:k]
+            max_dist = dists[idx[-1]]
+            if max_dist == 0:
+                max_dist = 1.0
+            u = dists[idx] / max_dist
+            w = np.maximum((1 - u ** 3) ** 3, 0)
+
+            xw = x_s[idx]
+            yw = y_s[idx]
+            sw = np.sum(w)
+            if sw == 0:
+                y_hat[i] = np.mean(yw)
+                continue
+            mx = np.sum(w * xw) / sw
+            my = np.sum(w * yw) / sw
+            ss_xx = np.sum(w * (xw - mx) ** 2)
+            if ss_xx == 0:
+                y_hat[i] = my
+            else:
+                slope = np.sum(w * (xw - mx) * (yw - my)) / ss_xx
+                y_hat[i] = my + slope * (x_s[i] - mx)
+
+        return x_s, y_hat
+
+    if pred is None and logit_vals is None:
+        raise ValueError("Either pred or logit_vals must be provided.")
+
+    if pred is not None:
+        pred = np.asarray(pred, dtype=float).ravel()
+        logit_vals = qlogis(pred)
+    else:
+        logit_vals = np.asarray(logit_vals, dtype=float).ravel()
+        pred = plogis(logit_vals)
+
+    real = np.asarray(real, dtype=float).ravel()
+    if len(pred) != len(real):
+        raise ValueError("The lengths of pred (or logit) and real are not consistent.")
+
+    assert riskdist in ("predicted", "calibrated")
+
+    def _spi(pv, yv):
+        z = np.sum((yv - pv) * (1 - 2 * pv)) / np.sqrt(np.sum((1 - 2 * pv) ** 2 * pv * (1 - pv)))
+        pval = 2 * norm.sf(np.abs(z))
+        return z, pval
+
+    nma = ~(np.isnan(pred) | np.isnan(real))
+    logit_vals = logit_vals[nma]
+    real = real[nma]
+    pred = pred[nma]
+    n = len(real)
+
+    if len(np.unique(pred)) == 1:
+        P = np.mean(real)
+        Intc = qlogis(P)
+        D = -1.0 / n
+        L01 = -2.0 * np.nansum(real * logit_vals - np.logaddexp(0, logit_vals))
+        L_cal = -2.0 * np.nansum(real * Intc - np.logaddexp(0, Intc))
+        U_chisq = L01 - L_cal
+        U_p = 1 - chi2.cdf(U_chisq, 1)
+        U = (U_chisq - 1) / n
+        Q = D - U
+        spi_z, spi_p = _spi(pred, real)
+        return {
+            "Dxy": 0.0, "C (ROC)": 0.5, "R2": 0.0, "D": D,
+            "D:Chi-sq": 0.0, "D:p": 1.0, "U": U, "U:Chi-sq": U_chisq,
+            "U:p": U_p, "Q": Q, "Brier": np.mean((real - pred[0]) ** 2),
+            "Intercept": Intc, "Slope": 0.0,
+            "Emax": 0.0, "E90": 0.0, "Eavg": abs(pred[0] - P),
+            "S:z": spi_z, "S:p": spi_p,
+        }
+
+    finite_mask = np.isfinite(logit_vals)
+    nm = int(np.sum(~finite_mask))
+    if nm > 0:
+        warnings.warn(
+            f"{nm} observations were excluded from the logistic calibration "
+            "because they had a probability of either 0 or 1."
+        )
+
+    logit_f = logit_vals[finite_mask]
+    y_f = real[finite_mask]
+    p_f = pred[finite_mask]
+    n_f = len(y_f)
+
+    X_recal = np.column_stack([np.ones_like(logit_f), logit_f])
+    recal_coef, recal_deviance = _logistic_fit(X_recal, y_f)
+    recal_intercept, recal_slope = recal_coef[0], recal_coef[1]
+
+    C = _roc_auc(y_f, p_f)
+    Dxy = 2 * (C - 0.5)
+
+    p_bar_f = np.mean(y_f)
+    L0_f = -2.0 * np.sum(
+        y_f * np.log(np.maximum(p_bar_f, 1e-15))
+        + (1 - y_f) * np.log(np.maximum(1 - p_bar_f, 1e-15))
+    )
+    L1_f = -2.0 * np.sum(y_f * logit_f - np.logaddexp(0, logit_f))
+
+    lr = L0_f - L1_f
+    p_lr = 1 - chi2.cdf(lr, 1) if lr > 0 else 1.0
+
+    L0_ll_f = -L0_f / 2.0
+    R2_num = 1 - np.exp(-lr / n_f)
+    R2_den = 1 - np.exp(2 * L0_ll_f / n_f)
+    R2 = R2_num / R2_den if R2_den != 0 else 0.0
+
+    D = (lr - 1) / n_f
+
+    L01 = -2.0 * np.nansum(real * logit_vals - np.logaddexp(0, logit_vals))
+    U_chisq = L01 - recal_deviance
+    p_U = 1 - chi2.cdf(U_chisq, 2) if U_chisq > 0 else 1.0
+    U = (U_chisq - 2) / n_f
+    Q = D - U
+
+    B = np.mean((pred - real) ** 2)
+
+    sm_x, sm_y = _lowess(pred, real, frac=2.0 / 3.0)
+    cal_smooth = np.interp(pred, sm_x, sm_y)
+    er = np.abs(pred - cal_smooth)
+    eavg = np.mean(er)
+    emax = np.max(er)
+    e90 = float(np.percentile(er, 90))
+
+    spi_z, spi_p = _spi(pred, real)
+
+    stats = {
+        "Dxy": Dxy, "C (ROC)": C, "R2": R2, "D": D,
+        "D:Chi-sq": lr, "D:p": p_lr, "U": U, "U:Chi-sq": U_chisq,
+        "U:p": p_U, "Q": Q, "Brier": B,
+        "Intercept": recal_intercept, "Slope": recal_slope,
+        "Emax": emax, "E90": e90, "Eavg": eavg,
+        "S:z": spi_z, "S:p": spi_p,
+    }
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_xlim((0, 1))
+    ax.set_ylim((0, 1))
+    ax.set_xlabel("Predicted Probability")
+    ax.set_ylabel("Actual Probability")
+    ax.set_aspect("equal")
+
+    ax.plot((0, 1), (0, 1), linewidth=6, color="0.85", label="Ideal", zorder=1)
+
+    if logistic_cal:
+        logit_seq = np.linspace(-7, 7, 200)
+        prob_seq = plogis(logit_seq)
+        pred_prob = plogis(recal_intercept + recal_slope * logit_seq)
+        ax.plot(prob_seq, pred_prob, "k-", linewidth=1,
+                label="Logistic calibration", zorder=3)
+    if nonparametric_cal:
+        ax.plot(sm_x, sm_y, "k:", linewidth=1,
+                label="Nonparametric", zorder=2)
+
+    if legendloc is not False:
+        if legendloc is None:
+            ax.legend(fontsize=cex * 10, frameon=False, loc="best")
+        else:
+            ax.legend(fontsize=cex * 10, frameon=False, loc=legendloc)
+
+    if statloc is not False:
+        dostats_keys = [
+            "Dxy", "C (ROC)", "R2", "D", "U", "Q",
+            "Brier", "Intercept", "Slope", "Emax", "E90", "Eavg",
+            "S:z", "S:p",
+        ]
+        stat_lines = "\n".join(
+            f"{k:<12s} {stats[k]:>.3f}" if stats[k] > 0 else f"{k:<12s}{stats[k]:>.3f}" for k in dostats_keys
+        )
+        if statloc is None:
+            ax.text(0.02, 0.98, stat_lines,
+                    transform=ax.transAxes,
+                    fontsize=cex * 10, family="monospace",
+                    verticalalignment="top")
+        else:
+            ax.text(statloc[0], statloc[1], stat_lines,
+                    fontsize=cex * 10, family="monospace",
+                    verticalalignment="top")
+
+    if riskdist:
+        if riskdist == "calibrated":
+            x_dist = plogis(recal_intercept + recal_slope * logit_vals)
+            x_dist = np.where(pred == 0, 0.0, x_dist)
+            x_dist = np.where(pred == 1, 1.0, x_dist)
+        else:
+            x_dist = pred.copy()
+
+        bins = np.linspace(0, 1, 101)
+        x_in = x_dist[(x_dist >= 0) & (x_dist <= 1)]
+        hist_vals, bin_edges = np.histogram(x_in, bins=bins)
+        j = hist_vals > 0
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        max_h = hist_vals.max() if hist_vals.max() > 0 else 1
+        spike_h = 0.15 * hist_vals[j] / max_h
+        ax.vlines(bin_centers[j], 0, spike_h,
+                  linewidth=0.5, color="black", zorder=1)
+
+    plt.tight_layout()
+
+    return fig, ax, stats
+
+
+def calibration_curves(
+        *dataframes: pd.DataFrame,
+        dataframe_cols: List[str],
+        logistic_cal: bool = True,
+        nonparametric_cal: bool = True,
+        legendloc: Optional[str | tuple[float | int] | Literal[False]] = None,
+        model_names: Optional[List[str]] = None,
+        colors: Optional[List[str]] = None,
+        cex: float | int = 0.7,
+) -> tuple[Figure, Axes, List[dict[str, float]]]:
+    r"""
+    Plot calibration curves for one or more prediction models.
+
+    Extends the single-model ``calibration_curve`` (Frank Harrell's
+    ``val.prob`` methodology) to support multiple models on a single plot.
+    Each model is drawn in a distinct colour, with its logistic
+    recalibration curve and lowess nonparametric smooth sharing the same
+    colour.  The 45° ideal line is rendered as a thin dashed line.
+
+    Parameters
+    ----------
+    *dataframes : sequence of pandas.DataFrame
+        One or more DataFrames, each containing at least the outcome column
+        and the predicted-probability column specified in ``dataframe_cols``.
+        All DataFrames must share the same column names given by
+        ``dataframe_cols``.  Each DataFrame is treated as a separate model.
+
+    dataframe_cols : list of str, length = 2
+        Column names to use.  ``dataframe_cols[0]`` is the binary outcome
+        variable (coded 0/1) and ``dataframe_cols[1]`` is the predicted
+        probability of the outcome (values in [0, 1]).
+
+    logistic_cal : bool, default=True
+        If ``True``, plot the two-parameter logistic recalibration curve
+        for every model.
+
+    nonparametric_cal : bool, default=True
+        If ``True``, plot the lowess nonparametric calibration curve for
+        every model.
+
+    legendloc : str, tuple of float, or False, default=None
+        Location of the legend.  Accepts any value valid for
+        :func:`matplotlib.axes.Axes.legend` ``loc`` parameter.
+        If ``None``, the legend is placed automatically (``"best"``).
+        Set to ``False`` to suppress the legend entirely.
+
+    model_names : list of str or None, default=None
+        Display names for each model in the legend.  Must have the same
+        length as the number of DataFrames.  If ``None``, defaults to
+        ``['Model 0', 'Model 1', ...]``.
+
+    colors : list of str or None, default=None
+        Matplotlib-compatible colour specifications for the model curves.
+        If ``None``, the current ``axes.prop_cycle`` colours are used.
+        For a given model, the logistic recalibration curve and the
+        nonparametric smooth share the same colour.
+
+    cex : float, default=0.7
+        Character expansion factor controlling the font size of the
+        legend.  The effective font size is ``cex * 10`` points.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    ax : matplotlib.axes.Axes
+
+    all_stats : list of dict
+        A list of dictionaries (one per model), each containing the
+        following discrimination and calibration statistics:
+
+        ============  =====================================================
+        Key           Description
+        ============  =====================================================
+        Dxy           Somers' Dxy rank correlation
+                      (\(= 2C - 1\)).
+        C (ROC)       Concordance statistic (AUC-ROC).
+        R2            Nagelkerke–Cox–Snell \(R^{2}\).
+        D             Discrimination index,
+                      \((LR_{\chi^{2}} - 1) / n\).
+        D:Chi-sq      Likelihood-ratio \(\chi^{2}\) statistic.
+        D:p           p-value for the likelihood-ratio test.
+        U             Unreliability index,
+                      \((U_{\chi^{2}} - 2) / n\).
+        U:Chi-sq      Unreliability \(\chi^{2}\) statistic.
+        U:p           p-value for the unreliability test.
+        Q             Quality index, \(D - U\).
+        Brier         Brier score,
+                      \(\frac{1}{n}\sum(y_i - \hat{p}_i)^{2}\).
+        Intercept     Logistic recalibration intercept (ideally 0).
+        Slope         Logistic recalibration slope (ideally 1).
+        Emax          Maximum absolute calibration error.
+        E90           90th-percentile absolute calibration error.
+        Eavg          Mean absolute calibration error.
+        S:z           Spiegelhalter's z-statistic.
+        S:p           Two-sided p-value for Spiegelhalter's test.
+        ============  =====================================================
+
+    Raises
+    ------
+    ValueError
+        If ``dataframe_cols`` does not have exactly two elements, or if the
+        number of ``model_names`` does not match the number of DataFrames.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import matplotlib.pyplot as plt
+    >>> import pandas as pd
+    >>> from plotcraft.draw import calibration_curves
+    >>> array = np.load('./data/true_score.npy')
+    >>> datas = [pd.DataFrame(np.array([array[i],array[i+1]]).T,columns=['true','pred']) for i in range(0,array.shape[0],2) if i != 14]
+    >>> fig, ax, all_stats = calibration_curves(*datas,dataframe_cols=['true','pred'])
+    >>> plt.show()
+    >>> print(all_stats)
+    >>> fig, ax, all_stats = calibration_curves(*datas, dataframe_cols=['true', 'pred'], logistic_cal=False)
+    >>> plt.show()
+    >>> fig, ax, all_stats = calibration_curves(*datas, dataframe_cols=['true', 'pred'], nonparametric_cal=False)
+    >>> plt.show()
+    """
+
+    if len(dataframe_cols) != 2:
+        raise ValueError("dataframe_cols must have exactly 2 elements: [outcome_col, pred_col].")
+    real_col, pred_col = dataframe_cols
+
+    if len(dataframes) == 0:
+        raise ValueError("At least one DataFrame must be provided.")
+
+    if model_names is None:
+        model_names = [f"Model {i}" for i in range(len(dataframes))]
+    elif len(model_names) != len(dataframes):
+        raise ValueError(
+            f"Length of model_names ({len(model_names)}) does not match "
+            f"the number of DataFrames ({len(dataframes)})."
+        )
+
+    if colors is None:
+        default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    else:
+        default_colors = colors
+
+    def _logistic_fit(X, y):
+        k = X.shape[1]
+        beta0 = np.zeros(k)
+
+        def neg_ll(beta):
+            eta = X @ beta
+            return -np.sum(y * eta - np.logaddexp(0, eta))
+
+        def grad(beta):
+            eta = X @ beta
+            pr = plogis(eta)
+            return -X.T @ (y - pr)
+
+        res = minimize(neg_ll, beta0, jac=grad, method="L-BFGS-B",
+                       options={"maxiter": 200, "ftol": 1e-12})
+        return res.x, 2 * res.fun
+
+    def _roc_auc(y, p):
+        y = np.asarray(y, dtype=int)
+        p = np.asarray(p, dtype=float)
+        pos, neg = p[y == 1], p[y == 0]
+        n1, n0 = len(pos), len(neg)
+        if n1 == 0 or n0 == 0:
+            return 0.5
+        all_vals = np.concatenate([pos, neg])
+        order = np.argsort(all_vals)
+        sorted_vals = all_vals[order]
+        ranks = np.empty(len(all_vals))
+        i = 0
+        while i < len(sorted_vals):
+            j = i
+            while j < len(sorted_vals) and sorted_vals[j] == sorted_vals[i]:
+                j += 1
+            ranks[i:j] = (i + 1 + j) / 2.0
+            i = j
+        ranks_orig = ranks[np.argsort(order)]
+        return (np.sum(ranks_orig[:n1]) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+
+    def _lowess(x, y, frac=2.0 / 3.0):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = len(x)
+        k = int(np.ceil(frac * n))
+        order = np.argsort(x)
+        x_s, y_s = x[order], y[order]
+        y_hat = np.zeros(n)
+        for i in range(n):
+            dists = np.abs(x_s - x_s[i])
+            idx = np.argsort(dists)[:k]
+            max_dist = max(dists[idx[-1]], 1.0) if dists[idx[-1]] == 0 else dists[idx[-1]]
+            u = dists[idx] / max_dist
+            w = np.maximum((1 - u ** 3) ** 3, 0)
+            xw, yw = x_s[idx], y_s[idx]
+            sw = np.sum(w)
+            if sw == 0:
+                y_hat[i] = np.mean(yw)
+                continue
+            mx = np.sum(w * xw) / sw
+            my = np.sum(w * yw) / sw
+            ss_xx = np.sum(w * (xw - mx) ** 2)
+            if ss_xx == 0:
+                y_hat[i] = my
+            else:
+                slope = np.sum(w * (xw - mx) * (yw - my)) / ss_xx
+                y_hat[i] = my + slope * (x_s[i] - mx)
+        return x_s, y_hat
+
+    def _spi(pv, yv):
+        z = np.sum((yv - pv) * (1 - 2 * pv)) / np.sqrt(
+            np.sum((1 - 2 * pv) ** 2 * pv * (1 - pv))
+        )
+        return z, 2 * norm.sf(np.abs(z))
+
+    def _compute_stats(real, pred):
+        """Compute all calibration / discrimination statistics for one model."""
+        logit_vals = qlogis(pred)
+
+        nma = ~(np.isnan(pred) | np.isnan(real))
+        logit_vals = logit_vals[nma]
+        real = real[nma]
+        pred = pred[nma]
+        n = len(real)
+
+        if len(np.unique(pred)) == 1:
+            P = np.mean(real)
+            Intc = qlogis(P)
+            D_val = -1.0 / n
+            L01 = -2.0 * np.nansum(real * logit_vals - np.logaddexp(0, logit_vals))
+            L_cal = -2.0 * np.nansum(real * Intc - np.logaddexp(0, Intc))
+            U_chisq = L01 - L_cal
+            U_p = 1 - chi2.cdf(U_chisq, 1)
+            U_val = (U_chisq - 1) / n
+            spi_z, spi_p = _spi(pred, real)
+            return (
+                {
+                    "Dxy": 0.0, "C (ROC)": 0.5, "R2": 0.0, "D": D_val,
+                    "D:Chi-sq": 0.0, "D:p": 1.0,
+                    "U": U_val, "U:Chi-sq": U_chisq, "U:p": U_p,
+                    "Q": D_val - U_val,
+                    "Brier": np.mean((real - pred[0]) ** 2),
+                    "Intercept": Intc, "Slope": 0.0,
+                    "Emax": 0.0, "E90": 0.0, "Eavg": abs(pred[0] - P),
+                    "S:z": spi_z, "S:p": spi_p,
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+
+        finite_mask = np.isfinite(logit_vals)
+        nm = int(np.sum(~finite_mask))
+        if nm > 0:
+            warnings.warn(
+                f"{nm} observations excluded from logistic calibration "
+                "(probability of exactly 0 or 1)."
+            )
+
+        logit_f = logit_vals[finite_mask]
+        y_f = real[finite_mask]
+        p_f = pred[finite_mask]
+        n_f = len(y_f)
+
+        X_recal = np.column_stack([np.ones_like(logit_f), logit_f])
+        recal_coef, recal_deviance = _logistic_fit(X_recal, y_f)
+        recal_intercept, recal_slope = recal_coef[0], recal_coef[1]
+
+        C = _roc_auc(y_f, p_f)
+        Dxy = 2 * (C - 0.5)
+
+        p_bar_f = np.mean(y_f)
+        L0_f = -2.0 * np.sum(
+            y_f * np.log(np.maximum(p_bar_f, 1e-15))
+            + (1 - y_f) * np.log(np.maximum(1 - p_bar_f, 1e-15))
+        )
+        L1_f = -2.0 * np.sum(y_f * logit_f - np.logaddexp(0, logit_f))
+
+        lr = L0_f - L1_f
+        p_lr = 1 - chi2.cdf(lr, 1) if lr > 0 else 1.0
+        L0_ll_f = -L0_f / 2.0
+        R2_num = 1 - np.exp(-lr / n_f)
+        R2_den = 1 - np.exp(2 * L0_ll_f / n_f)
+        R2 = R2_num / R2_den if R2_den != 0 else 0.0
+        D_val = (lr - 1) / n_f
+
+        L01 = -2.0 * np.nansum(real * logit_vals - np.logaddexp(0, logit_vals))
+        U_chisq = L01 - recal_deviance
+        p_U = 1 - chi2.cdf(U_chisq, 2) if U_chisq > 0 else 1.0
+        U_val = (U_chisq - 2) / n_f
+        Q = D_val - U_val
+        B = np.mean((pred - real) ** 2)
+
+        sm_x, sm_y = _lowess(pred, real, frac=2.0 / 3.0)
+        cal_smooth = np.interp(pred, sm_x, sm_y)
+        er = np.abs(pred - cal_smooth)
+
+        spi_z, spi_p = _spi(pred, real)
+
+        stats = {
+            "Dxy": Dxy, "C (ROC)": C, "R2": R2, "D": D_val,
+            "D:Chi-sq": lr, "D:p": p_lr,
+            "U": U_val, "U:Chi-sq": U_chisq, "U:p": p_U,
+            "Q": Q, "Brier": B,
+            "Intercept": recal_intercept, "Slope": recal_slope,
+            "Emax": np.max(er), "E90": float(np.percentile(er, 90)),
+            "Eavg": np.mean(er),
+            "S:z": spi_z, "S:p": spi_p,
+        }
+        return stats, recal_intercept, recal_slope, sm_x, sm_y
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_xlim((0, 1))
+    ax.set_ylim((0, 1))
+    ax.set_xlabel("Predicted Probability")
+    ax.set_ylabel("Actual Probability")
+    ax.set_aspect("equal")
+
+    ax.plot((0, 1), (0, 1), linestyle="--", linewidth=1,
+            color="grey", label="Ideal", zorder=1)
+
+    all_stats: List[dict] = []
+
+    for idx, df in enumerate(dataframes):
+        assert isinstance(df, pd.DataFrame), f"Argument {idx} is not a DataFrame."
+        real_arr = np.asarray(df[real_col], dtype=float).ravel()
+        pred_arr = np.asarray(df[pred_col], dtype=float).ravel()
+
+        pred_arr = np.clip(pred_arr, 1e-15, 1 - 1e-15)
+
+        color = default_colors[idx % len(default_colors)]
+        name = model_names[idx]
+
+        stats, r_int, r_slope, sm_x, sm_y = _compute_stats(real_arr, pred_arr)
+        all_stats.append(stats)
+
+        if logistic_cal and r_int is not None:
+            logit_seq = np.linspace(-7, 7, 200)
+            prob_seq = plogis(logit_seq)
+            pred_prob = plogis(r_int + r_slope * logit_seq)
+            ax.plot(prob_seq, pred_prob, "-", color=color, linewidth=1,
+                    label=f"{name} — Logistic", zorder=3)
+
+        if nonparametric_cal and sm_x is not None:
+            ax.plot(sm_x, sm_y, ":", color=color, linewidth=1,
+                    label=f"{name} — Nonparametric", zorder=2)
+
+    if legendloc is not False:
+        loc = "best" if legendloc is None else legendloc
+        handles, labels = [], []
+
+        handles.append(Line2D([0], [0], linestyle="--", linewidth=1, color="grey"))
+        labels.append("Ideal")
+
+        if logistic_cal:
+            handles.append(Line2D([0], [0], linestyle="-", linewidth=1, color="black"))
+            labels.append("Logistic")
+        if nonparametric_cal:
+            handles.append(Line2D([0], [0], linestyle=":", linewidth=1, color="black"))
+            labels.append("Nonparametric")
+
+        for idx_m, name in enumerate(model_names):
+            c = default_colors[idx_m % len(default_colors)]
+            handles.append(Line2D([0], [0], linestyle="-", linewidth=2, color=c))
+            labels.append(name)
+
+        ax.legend(handles, labels, fontsize=cex * 10, frameon=False, loc=loc)
+
+    plt.tight_layout()
+    return fig, ax, all_stats
+
+
+def plot_function_with_asymptote(
+        f: sp.Expr,
+        var: sp.Symbol,
+        x_range: tuple[float | int, float | int] = (-10, 10),
+        n_points: int = 1000,
+        curve_color: Optional[str] = None,
+        asymptote_color: Optional[str] = None,
+        add_asymptote: Optional[List[Callable]] = None,
+        verbose:bool = True,
+) -> tuple[Figure, Axes]:
+    """
+    Plot a SymPy symbolic function with automatic asymptote detection.
+
+    Automatically computes the continuous domain, detects vertical /
+    horizontal / oblique asymptotes, and renders the curve with proper
+    discontinuity handling (jump detection & segment splitting).
+
+    Parameters
+    ----------
+    f : sympy.Expr
+        The symbolic expression to plot, e.g. ``sin(x) / x``.
+
+    var : sympy.Symbol, default=x
+        The free variable in ``f``.
+
+    x_range : tuple of (float, float), default=(-10, 10)
+        The horizontal viewing window ``(x_min, x_max)``.
+
+    n_points : int, default=1000
+        Total number of sample points distributed across all valid
+        intervals.  More points yield a smoother curve at the cost of
+        longer computation.
+
+    curve_color : str or None, default=None
+        Matplotlib color string for the main curve.  When ``None``,
+        defaults to ``"red"``.
+
+    asymptote_color : str or None, default=None
+        Matplotlib color string for every asymptote line (both
+        auto-detected and manually supplied).  When ``None``, defaults
+        to ``"grey"``.
+
+    add_asymptote : list of callable or None, default=None
+        Extra asymptote curves that cannot be found automatically.
+        Each element must be a callable with signature
+        ``func(x_array) -> y_array`` (NumPy-compatible).  The function
+        is allowed to return ``np.inf`` / ``np.nan`` at isolated
+        points; those points are filtered out and the line is split
+        into continuous segments automatically.
+
+    verbose: bool, default=True
+        if verbose is true, print some details
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    ax : matplotlib.axes.Axes
+
+    Notes
+    -----
+    - The continuous domain is computed via
+      ``sympy.calculus.util.continuous_domain``.
+    - Vertical asymptotes are located by combining three strategies:
+      excluded points of the domain, ``sympy.singularities``, and
+      roots of the denominator after ``cancel``.  Candidates are then
+      verified numerically.
+    - Horizontal / oblique asymptotes are found by evaluating
+      ``lim_{x->±∞} f/x`` and ``lim_{x->±∞} (f - kx)``.
+    - Large jumps between consecutive sample points are detected with
+      a median-based threshold so that branches separated by a
+      vertical asymptote are never connected by a spurious line.
+
+    Examples
+    --------
+    >>> from sympy import symbols, tan, sqrt, sin
+    >>> x = symbols("x")
+
+    Plot ``tan(x)`` with automatically detected vertical asymptotes:
+
+    >>> f = tan(x)
+    >>> plot_function(f, x, x_range=(-10, 10), n_points=1000)
+
+    Plot ``sqrt(x² - 1)`` whose domain excludes ``(-1, 1)``:
+
+    >>> f = sqrt(x**2 - 1)
+    >>> plot_function(f, x, x_range=(-10, 10), n_points=1000)
+
+    Plot ``sin(x)/x`` and manually add the curvilinear asymptote
+    ``y = 1/x`` (which has its own singularity at ``x = 0``):
+
+    >>> f = sin(x) / x
+    >>> plot_function(
+    ...     f, x,
+    ...     x_range=(-10, 10),
+    ...     n_points=1000,
+    ...     add_asymptote=[lambda t: 1 / t],
+    ... )
+    """
+    def enumerate_set_points(s, x_lo, x_hi, max_n=200):
+        pts = []
+        if isinstance(s, sp.FiniteSet):
+            for p in s:
+                try:
+                    v = float(p)
+                    if x_lo - 0.01 <= v <= x_hi + 0.01:
+                        pts.append(v)
+                except (TypeError, ValueError):
+                    pass
+        elif isinstance(s, sp.Union):
+            for part in s.args:
+                pts.extend(enumerate_set_points(part, x_lo, x_hi, max_n))
+        elif isinstance(s, sp.ImageSet):
+            lam = s.lamda
+            n_var = lam.variables[0]
+            expr = lam.expr
+            for i in range(-max_n, max_n + 1):
+                try:
+                    v = float(expr.subs(n_var, i))
+                    if x_lo - 0.01 <= v <= x_hi + 0.01:
+                        pts.append(v)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        elif isinstance(s, sp.Complement):
+            pts.extend(enumerate_set_points(s.args[1], x_lo, x_hi, max_n))
+        return sorted(set(round(p, 12) for p in pts))
+
+    def get_excluded_points(domain, x_lo, x_hi):
+        pts = []
+        if isinstance(domain, sp.Complement):
+            pts.extend(enumerate_set_points(domain.args[1], x_lo, x_hi))
+        elif isinstance(domain, sp.Union):
+            for part in domain.args:
+                pts.extend(get_excluded_points(part, x_lo, x_hi))
+        return sorted(set(pts))
+
+    def domain_to_intervals(domain, x_lo, x_hi):
+        view = sp.Interval(x_lo, x_hi)
+        clipped = domain.intersect(view)
+        return _set_to_intervals(clipped, x_lo, x_hi)
+
+    def _set_to_intervals(s, x_lo, x_hi):
+        if s == sp.S.EmptySet:
+            return []
+        if isinstance(s, sp.Interval):
+            lo = max(float(s.start) if s.start != -sp.oo else x_lo, x_lo)
+            hi = min(float(s.end) if s.end != sp.oo else x_hi, x_hi)
+            return [(lo, hi)] if lo < hi else []
+        if isinstance(s, sp.Union):
+            intervals = []
+            for part in s.args:
+                intervals.extend(_set_to_intervals(part, x_lo, x_hi))
+            return sorted(intervals)
+        if isinstance(s, sp.FiniteSet):
+            return []
+        if isinstance(s, sp.Complement):
+            base_intervals = _set_to_intervals(s.args[0], x_lo, x_hi)
+            excluded_pts = enumerate_set_points(s.args[1], x_lo, x_hi)
+            if not excluded_pts:
+                return base_intervals
+            result = []
+            for lo, hi in base_intervals:
+                cuts = sorted([p for p in excluded_pts if lo < p < hi])
+                bounds = [lo] + cuts + [hi]
+                for i in range(len(bounds) - 1):
+                    a, b = bounds[i], bounds[i + 1]
+                    if b - a > 1e-12:
+                        result.append((a, b))
+            return result
+        return [(x_lo, x_hi)]
+
+    def find_vertical_asymptotes(f, var, x_range=(-10, 10), domain=None):
+        x_lo, x_hi = x_range
+        candidates = set()
+
+        if domain is not None:
+            excluded = get_excluded_points(domain, x_lo, x_hi)
+            candidates.update(excluded)
+
+        try:
+            from sympy import singularities as _sing
+            sing = _sing(f, var)
+            pts = enumerate_set_points(sing, x_lo, x_hi)
+            candidates.update(pts)
+        except Exception:
+            pass
+
+        try:
+            d = sp.denom(sp.cancel(f))
+            for c in sp.solve(d, var):
+                try:
+                    if c.is_real:
+                        cv = float(c)
+                        if x_lo <= cv <= x_hi:
+                            candidates.add(cv)
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            pass
+
+        if not candidates:
+            return []
+
+        f_np = sp.lambdify(var, f, modules=["numpy"])
+        v_asym = []
+        for c in candidates:
+            eps = 1e-8
+            try:
+                with np.errstate(all="ignore"):
+                    y_left = abs(float(f_np(c - eps)))
+                    y_right = abs(float(f_np(c + eps)))
+                if y_left > 1e6 or y_right > 1e6:
+                    v_asym.append(c)
+            except Exception:
+                v_asym.append(c)
+
+        return sorted(set(round(v, 10) for v in v_asym))
+
+    def find_oblique_asymptotes(f, var):
+        results = []
+        for direction, inf_val in [("+inf", sp.oo), ("-inf", -sp.oo)]:
+            try:
+                k = sp.limit(f / var, var, inf_val)
+                if k in (sp.oo, -sp.oo, sp.zoo, sp.nan) or not k.is_finite:
+                    continue
+                b = sp.limit(f - k * var, var, inf_val)
+                if b in (sp.oo, -sp.oo, sp.zoo, sp.nan) or not b.is_finite:
+                    continue
+                results.append((float(k), float(b), direction))
+            except Exception:
+                pass
+        if (len(results) == 2
+                and np.isclose(results[0][0], results[1][0])
+                and np.isclose(results[0][1], results[1][1])):
+            return [(results[0][0], results[0][1], "both")]
+        return results
+
+    def sample_segments(f, intervals, var, n=1000, v_asym=None):
+        if v_asym is None:
+            v_asym = []
+
+        va_set = set(round(v, 10) for v in v_asym)
+
+        fine = []
+        for lo, hi in intervals:
+            cuts = sorted([a for a in v_asym if lo + 1e-9 < a < hi - 1e-9])
+            bounds = [lo] + cuts + [hi]
+            for i in range(len(bounds) - 1):
+                a, b = bounds[i], bounds[i + 1]
+                eps = (b - a) * 0.002
+                a_adj = a + eps if round(a, 10) in va_set else a
+                b_adj = b - eps if round(b, 10) in va_set else b
+                if b_adj - a_adj > 1e-12:
+                    fine.append((a_adj, b_adj))
+
+        total_len = sum(hi - lo for lo, hi in fine)
+        if total_len == 0:
+            return []
+
+        f_np = sp.lambdify(var, f, modules=["numpy"])
+        segments = []
+
+        for lo, hi in fine:
+            seg_n = max(6, int(n * (hi - lo) / total_len))
+            seg_x = np.linspace(lo, hi, seg_n)
+            with np.errstate(all="ignore"):
+                seg_y = np.asarray(f_np(seg_x), dtype=float)
+            mask = np.isfinite(seg_y)
+            if mask.any():
+                sx, sy = seg_x[mask], seg_y[mask]
+                if len(sy) > 1:
+                    segments.extend(_split_at_jumps(sx, sy))
+                else:
+                    segments.append((sx, sy))
+        return segments
+
+    def _split_at_jumps(xs, ys, factor=50):
+        diffs = np.abs(np.diff(ys))
+        median_diff = np.median(diffs) if len(diffs) > 0 else 1
+        threshold = max(median_diff * factor, 5)
+        jumps = np.where(diffs > threshold)[0]
+        segs = []
+        prev = 0
+        for j in jumps:
+            if j + 1 - prev >= 2:
+                segs.append((xs[prev:j + 1], ys[prev:j + 1]))
+            prev = j + 1
+        if len(xs) - prev >= 2:
+            segs.append((xs[prev:], ys[prev:]))
+        return segs if segs else [(xs, ys)]
+
+
+    domain = sp.calculus.util.continuous_domain(f, var, sp.S.Reals)
+
+    intervals = domain_to_intervals(domain, x_range[0], x_range[1])
+
+    texts = [f"function: f(x) = {f}", f"domain of definition: {domain}", f"Drawing interval({len(intervals)} segment): {intervals[:8]}{'...' if len(intervals) > 8 else ''}"]
+
+
+    v_asym = find_vertical_asymptotes(f, var, x_range, domain=domain)
+    o_asym = find_oblique_asymptotes(f, var)
+
+    if v_asym:
+        labels = [f"x={round(a, 4)}" for a in v_asym]
+        texts.append(f"vertical asymptotes (with a total of {len(v_asym)} lines): {labels[:10]}{'...' if len(labels) > 10 else ''}")
+    else:
+        texts.append("vertical asymptotes: None")
+
+    for k, b, d in o_asym:
+        kind = "horizontal" if k == 0 else "oblique"
+        sign = "+" if b >= 0 else "-"
+        eq = f"y = {k}x {sign} {abs(b)}" if k != 0 else f"y = {b}"
+        texts.append(f"{kind}asymptotes: {eq}  (direction: {d})")
+
+    segments = sample_segments(f, intervals, var, n_points, v_asym)
+    if not segments:
+        texts.append("No valid points could be sampled within the given range.")
+        return None, None
+
+    all_y = np.concatenate([s[1] for s in segments])
+    y_lo, y_hi = np.percentile(all_y, 2), np.percentile(all_y, 98)
+    y_margin = (y_hi - y_lo) * 0.3 + 0.5
+    y_view = (y_lo - y_margin, y_hi + y_margin)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if curve_color is None:
+        curve_color = "red"
+    if asymptote_color is None:
+        asymptote_color = "grey"
+
+    for i, (sx, sy) in enumerate(segments):
+        ax.plot(sx, sy, color=curve_color, linewidth=2,
+                label="f(x)" if i == 0 else None)
+
+    for i, va in enumerate(v_asym):
+        ax.axvline(va, color=asymptote_color, linestyle="--", linewidth=1, alpha=0.6)
+
+    for i, (k, b, d) in enumerate(o_asym):
+        xl = np.linspace(x_range[0], x_range[1], 300)
+        yl = k * xl + b
+        ax.plot(xl, yl, color=asymptote_color, linestyle="-.", linewidth=1.2,
+                alpha=0.8)
+
+    if add_asymptote:
+        xl = np.linspace(x_range[0], x_range[1], 300)
+        for i, func in enumerate(add_asymptote):
+            try:
+                with np.errstate(all="ignore"):
+                    yl = np.asarray(func(xl), dtype=float)
+                mask = np.isfinite(yl)
+                if not mask.any():
+                    texts.append(f"additional asymptote {i + 1}: there are no valid points within the given range, so skipping.")
+                    continue
+                seg_indices = np.split(np.where(mask)[0],
+                                       np.where(np.diff(np.where(mask)[0]) > 1)[0] + 1)
+                for idx_chunk in seg_indices:
+                    if len(idx_chunk) < 2:
+                        continue
+                    sx, sy = xl[idx_chunk], yl[idx_chunk]
+                    sub_segs = _split_at_jumps(sx, sy)
+                    for ssx, ssy in sub_segs:
+                        ax.plot(ssx, ssy, color=asymptote_color, linestyle="-.", linewidth=1.2,
+                                alpha=0.8)
+            except Exception as e:
+                texts.append(f"An error occurred when drawing the supplementary asymptote {i + 1}: {e}")
+
+    if verbose:
+        print('\n'.join(texts))
+
+    ax.set_xlim(x_range)
+    ax.set_ylim(y_view)
+    ax.axhline(0, color="black", linewidth=0.4)
+    ax.axvline(0, color="black", linewidth=0.4)
+    ax.set_xlabel("x", fontsize=12)
+    ax.set_ylabel("y", fontsize=12)
+
+    asymptote_handle = Line2D([], [], color=asymptote_color, linestyle="--",
+                              linewidth=1, alpha=0.6, label="asymptote")
+    handles, labels = ax.get_legend_handles_labels()
+    handles.append(asymptote_handle)
+    labels.append("asymptote")
+    ax.legend(handles=handles, labels=labels, loc="best", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig, ax
 
 if __name__ == '__main__':
-    import numpy as np
-    from sklearn.model_selection import train_test_split
-    real = np.random.randn(100)
-    pred = np.random.randn(100)
-    correlation_graph_between_prediction_and_reality(real, pred)
+    array = np.load('./data/true_score.npy')
+    fig, ax, result = calibration_curve(array[0], array[1])
     plt.show()
+    print(result)
